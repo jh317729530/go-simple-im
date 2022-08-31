@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"encoding/binary"
 	"flag"
 	"io"
 	"log"
@@ -54,10 +55,14 @@ func acceptTcp(listener *net.TCPListener) {
 }
 
 func serveTCP(conn *net.TCPConn) {
+
+	addr := conn.RemoteAddr()
+
 	// 封装连接
 	channel := &model.Channel{
 		Conn:   conn,
-		Signal: make(chan *model.Data, 10),
+		Signal: make(chan *model.Packet, 10),
+		Addr:   addr,
 	}
 
 	// 开启协程处理写事件
@@ -66,41 +71,76 @@ func serveTCP(conn *net.TCPConn) {
 	// 这个协程处理读事件
 	for {
 		// 解码数据，封装成Data，进行业务逻辑，然后写入Signal返回resp
-		bytes, err := readTCP(channel)
+		packet, err := readTCP(channel)
 		if err != nil {
 			// 断开连接
 			break
 		}
-		log.Printf("server receive info:%s", string(bytes))
 
-		data := &model.Data{
-			Content: []byte("server receive!"),
+		switch packet.Operation {
+		case model.HeartBeat:
+			log.Printf("heart beat from:%s", addr.String())
+			// 写入心跳回复
+			packet.Length = model.PacketLengthSize + model.VersionSize + model.OperationSize
+			packet.Version = model.Version1
+			packet.Operation = model.HeartBeatReply
+
+			channel.Signal <- packet
 		}
 
-		channel.Signal <- data
+		//channel.Signal <- data
 	}
 }
 
-func readTCP(channel *model.Channel) ([]byte, error) {
+func readTCP(channel *model.Channel) (*model.Packet, error) {
 	conn := channel.Conn
 
 	reader := bufio.NewReader(conn)
 
-	data, err := reader.ReadSlice('\n')
+	packetBytes := make([]byte, 4)
+	_, err := io.ReadFull(reader, packetBytes)
 	if err != nil {
-		if err != io.EOF {
-			log.Println(err)
-		} else {
-			return data, err
-		}
+		return nil, err
 	}
-	return data, nil
+
+	packetLength := binary.BigEndian.Uint32(packetBytes)
+
+	bytes := make([]byte, packetLength-4)
+	_, err = io.ReadFull(reader, bytes)
+	if err != nil {
+		return nil, err
+	}
+
+	packet := new(model.Packet)
+	packet.Length = packetLength
+	packet.Version = binary.BigEndian.Uint32(bytes[model.VersionOffset:model.OperationOffset])
+	packet.Operation = binary.BigEndian.Uint32(bytes[model.OperationOffset:model.BodyOffset])
+	// TODO body解析
+
+	return packet, nil
 }
 
 func dispatchTCP(channel *model.Channel) {
+	writer := bufio.NewWriter(channel.Conn)
 	for {
-		data := <-channel.Signal
-		data.Content = append(data.Content, '\n')
-		channel.Conn.Write(data.Content)
+		packet := <-channel.Signal
+		switch packet.Operation {
+		case model.HeartBeatReply:
+			bytes := make([]byte, packet.Length)
+			binary.BigEndian.PutUint32(bytes, packet.Length)
+			binary.BigEndian.PutUint32(bytes[model.VersionOffset+model.PacketLengthSize:model.OperationOffset+model.PacketLengthSize], packet.Version)
+			binary.BigEndian.PutUint32(bytes[model.OperationOffset+model.PacketLengthSize:model.BodyOffset+model.PacketLengthSize], packet.Operation)
+			_, err := writer.Write(bytes)
+			if err != nil {
+				break
+			}
+		}
+
+		err := writer.Flush()
+		if err != nil {
+			break
+		}
 	}
+
+	channel.Conn.Close()
 }
